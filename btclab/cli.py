@@ -170,6 +170,16 @@ def cmd_report(a) -> None:
     _print_report(Ledger(a.db), a.mode, a.breakdown)
 
 
+def cmd_pnl(a) -> None:
+    c = Ledger(a.db).current_pnl(a.mode)
+    print(f"current P&L {c['current_pnl']:+.2f}   (realized {c['realized_pnl']:+.2f} on {c['settled_trades']} settled, "
+          f"open {c['unrealized_pnl']:+.2f} on {c['open_trades']} open trades)")
+    if c["open_trades"]:
+        note = f"   {c['unpriced_open_trades']} open trades had no quote and are carried at cost" if c["unpriced_open_trades"] else ""
+        print(f"  open positions cost {c['open_cost']:.2f}, worth {c['open_value']:.2f} at the bid "
+              f"(quotes as of {(c['quotes_as_of'] or 'n/a')[:16].replace('T', ' ')} UTC){note}")
+
+
 def cmd_validate(a) -> None:
     from . import validate
 
@@ -287,6 +297,10 @@ def main(argv=None) -> None:
     p.add_argument("--mode", choices=["paper", "live"])
     p.add_argument("--breakdown", action="store_true", help="P&L by side and fair-value bucket")
     p.set_defaults(fn=cmd_report)
+
+    p = sub.add_parser("pnl", help="current profit: realized plus open positions at the bid (offline, instant)")
+    p.add_argument("--mode", choices=["paper", "live"])
+    p.set_defaults(fn=cmd_pnl)
 
     p = sub.add_parser("validate", help="calibration study on historical candles")
     p.add_argument("--days", type=int, default=14, help="days of history (at least 6)")

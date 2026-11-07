@@ -101,3 +101,26 @@ def test_pnl_check_and_settlement_scope():
     assert chk["events"] == 20
     # Expected +0.10*10 per trade = $20 total; realized: 10 wins of +6, 10 losses of -4 = +20.
     assert chk["pnl_minus_expected"] == pytest.approx(0.0, abs=1e-6)
+
+
+def test_current_pnl_marks_open_trades_at_bid():
+    from btclab.ledger import Ledger
+
+    led = Ledger(":memory:")
+    ins = "INSERT INTO trades (ts,mode,ticker,event_ticker,side,price,count,fee,status,pnl) VALUES (?,?,?,?,?,?,?,?,?,?)"
+    led.db.execute(ins, ("t", "paper", "A", "E", "yes", 0.30, 10, 0.10, "settled", 6.90))
+    led.db.execute(ins, ("t", "paper", "B", "E", "yes", 0.20, 10, 0.10, "open", None))  # bid 0.25
+    led.db.execute(ins, ("t", "paper", "C", "E", "no", 0.40, 5, 0.05, "open", None))   # NO bid = 1 - 0.70
+    led.db.execute(ins, ("t", "paper", "D", "E", "yes", 0.50, 2, 0.02, "open", None))  # no snapshot
+    snap = "INSERT INTO snapshots (ts,ticker,yes_bid,yes_ask) VALUES (?,?,?,?)"
+    led.db.execute(snap, ("2026-01-01T00:00:00+00:00", "B", 0.10, 0.15))  # older quote, ignored
+    led.db.execute(snap, ("2026-01-01T00:05:00+00:00", "B", 0.25, 0.27))
+    led.db.execute(snap, ("2026-01-01T00:05:00+00:00", "C", 0.68, 0.70))
+    c = led.current_pnl()
+    assert c["realized_pnl"] == 6.90 and c["settled_trades"] == 1 and c["open_trades"] == 3
+    assert c["open_cost"] == round(2.10 + 2.05 + 1.02, 2)
+    assert c["open_value"] == round(2.50 + 1.50 + 1.00, 2)
+    assert c["unrealized_pnl"] == round(5.00 - 5.17, 2)
+    assert c["current_pnl"] == round(6.90 - 0.17, 2)
+    assert c["unpriced_open_trades"] == 1
+    assert led.current_pnl("live")["open_trades"] == 0

@@ -216,6 +216,48 @@ class Ledger:
         out.update(self.calibration())
         return out
 
+    def current_pnl(self, mode: Optional[str] = None) -> dict:
+        """Realized P&L plus open positions marked at what they'd sell for now.
+
+        Open trades are valued at the latest stored snapshot's bid for their side
+        (YES at yes_bid, NO at 1 - yes_ask), so no network call is needed. That is
+        a conservative liquidation value; a missing bid counts as 0.
+        """
+        where, args = ("AND mode=?", (mode,)) if mode else ("", ())
+        realized, settled = self.db.execute(
+            f"SELECT COALESCE(SUM(pnl),0), COUNT(*) FROM trades WHERE status='settled' {where}", args
+        ).fetchone()
+        rows = self.db.execute(
+            "SELECT t.side, t.price, t.count, t.fee, s.yes_bid, s.yes_ask, s.ts snap_ts FROM trades t "
+            "LEFT JOIN snapshots s ON s.rowid = (SELECT MAX(rowid) FROM snapshots WHERE ticker = t.ticker) "
+            f"WHERE t.status='open' {where}",
+            args,
+        ).fetchall()
+        cost = value = 0.0
+        unpriced = 0
+        last_ts = None
+        for r in rows:
+            cost += r["price"] * r["count"] + r["fee"]
+            if r["snap_ts"] is None:
+                unpriced += 1
+                value += r["price"] * r["count"]  # no quote stored: carry at cost
+                continue
+            bid = r["yes_bid"] if r["side"] == "yes" else (1.0 - r["yes_ask"] if r["yes_ask"] is not None else None)
+            value += (bid or 0.0) * r["count"]
+            last_ts = max(last_ts or r["snap_ts"], r["snap_ts"])
+        unrealized = value - cost
+        return {
+            "realized_pnl": round(realized, 2),
+            "settled_trades": settled,
+            "open_trades": len(rows),
+            "open_cost": round(cost, 2),
+            "open_value": round(value, 2),
+            "unrealized_pnl": round(unrealized, 2),
+            "current_pnl": round(realized + unrealized, 2),
+            "unpriced_open_trades": unpriced,
+            "quotes_as_of": last_ts,
+        }
+
     def pnl_check(self, mode: Optional[str] = None) -> dict:
         """Is realized P&L consistent with expected? Uses events as independent units.
 

@@ -27,7 +27,7 @@ It runs on a laptop using free data, and it starts in paper mode.
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-python -m pytest                       # 45 tests, no network needed
+python -m pytest                       # 46 tests, no network needed
 python -m btclab demo                  # offline simulation, about a minute
 python -m btclab price --spot 80000 --strike 81000 --hours 3 --vol 0.5
 ```
@@ -40,6 +40,7 @@ python -m btclab price --spot 80000 --strike 81000 --hours 3 --vol 0.5
 | 2. Look at live prices | `python -m btclab scan` | Fair value ± uncertainty vs. Kalshi for every open BTC market, with edges before and after the haircut. No trading. |
 | 3. Paper trade | `python -m btclab run --interval 60` | Logs the trades it *would* make at real prices, with every risk check applied, and learns its shrinkage table from settled markets. Run it for weeks. |
 | 4. Score it | `python -m btclab report --breakdown` | Realized vs. expected P&L with a 95% band, model vs. market log loss, calibration table, P&L by side and bucket. |
+| (any time) | `python -m btclab pnl` | Current profit in one line: realized P&L plus open positions valued at what they would sell for now. Instant, offline. |
 | (any time) | `python -m btclab verify` | Reruns the multi-seed simulation honesty check from the table below. |
 | 5. Go live, small | `python -m btclab run --live` | Real orders. See the checklist below. |
 
@@ -170,7 +171,7 @@ btclab/
   validate.py    out-of-sample calibration study on historical candles
   sim.py         simulator: stochastic vol, seasonality, jumps, imperfect market makers
   cli.py         command line
-tests/           45 tests: GARCH parameter recovery, Monte Carlo vs. closed form, shrinkage,
+tests/           46 tests: GARCH parameter recovery, Monte Carlo vs. closed form, shrinkage,
                  fees, order book, signing, risk, ledger, API wiring, end-to-end simulation
 ```
 

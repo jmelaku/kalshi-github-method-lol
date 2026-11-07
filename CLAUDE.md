@@ -16,7 +16,7 @@ They're comfortable running terminal commands but new to this codebase. Explain 
 - MacBook Air (Apple Silicon), project at `~/Downloads/kalshi-btc-lab`.
 - **System Python 3.9.6** in a venv at `.venv`. Code MUST stay 3.9-compatible: every module uses `from __future__ import annotations`; don't use `match`, runtime `X | Y` unions, `zip(strict=)`, or other 3.10+ features. (`pyproject.toml` says >=3.10; that's stale, 3.9 works and is tested.)
 - A harmless `NotOpenSSLWarning` (LibreSSL) appears on every run. Ignore it.
-- All 45 tests pass on their machine (`python -m pytest`).
+- All 46 tests pass on their machine (`python -m pytest`).
 - They have NOT yet connected a Kalshi API key or run anything against live Kalshi.
 
 ## 2. Current status
@@ -36,7 +36,7 @@ They're comfortable running terminal commands but new to this codebase. Explain 
 All run from the project root with the venv active (`source .venv/bin/activate`).
 
 ```
-python -m pytest                     # 45 tests, offline
+python -m pytest                     # 46 tests, offline
 python -m btclab price --spot 80000 --strike 81000 --hours 3 --vol 0.5   # closed-form calculator
 python -m btclab validate --days 14  # out-of-sample model test on real Coinbase candles (needs network, >=6 days)
 python -m btclab validate --synthetic --days 10   # same, offline on simulated data
@@ -47,6 +47,7 @@ python -m btclab run [--interval 60] [--hours N]  # paper trading loop
 python -m btclab run --live          # real orders (locked, see §8)
 python -m btclab settle              # record results of finished markets
 python -m btclab report [--breakdown] [--mode paper|live]
+python -m btclab pnl [--mode paper|live]           # current profit: realized + open positions at the bid (instant, offline)
 ```
 
 Global flags: `--config config.json` (default) and `--db data/btclab.db` (default).
@@ -74,7 +75,7 @@ btclab/
   validate.py    Out-of-sample calibration studies on candles
   sim.py         Realistic simulator (stochastic vol, seasonality, fat tails, jumps, imperfect market makers)
   cli.py         argparse CLI
-tests/           45 tests (see §9)
+tests/           46 tests (see §9)
 docs/RESUME_AND_INTERVIEWS.md   resume bullets + interview prep (owner-facing)
 README.md        user-facing docs, including the full version history and verification table
 ```
