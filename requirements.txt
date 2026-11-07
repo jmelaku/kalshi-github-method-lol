@@ -1,0 +1,6 @@
+numpy>=1.26
+scipy>=1.11
+requests>=2.31
+cryptography>=42
+pandas>=2.1
+pytest>=8

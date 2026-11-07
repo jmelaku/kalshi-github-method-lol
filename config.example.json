@@ -1,0 +1,45 @@
+{
+  "engine": {
+    "pricer": "fhs",
+    "n_paths": 20000,
+    "vol_uncertainty": 0.15,
+    "garch_lookback_min": 5760,
+    "garch_refit_min": 240,
+    "implied_weight": 0.5,
+    "haircut_k": 1.0,
+    "calibrate": true,
+    "basis_usd": 20.0,
+    "snapshot_interval_s": 300,
+    "max_trades_per_cycle": 5,
+    "shrink_prior_beta": 0.5,
+    "shrink_prior_sd": 0.25,
+    "shrink_min_days": 10,
+    "shrink_z_se": 1.0,
+    "evidence_classes": [
+      "threshold"
+    ],
+    "evidence_min_days": 20,
+    "evidence_min_events": 30
+  },
+  "risk": {
+    "bankroll_usd": 200.0,
+    "kelly_fraction": 0.1,
+    "min_edge_usd": 0.02,
+    "min_edge_frac": 0.05,
+    "min_price": 0.03,
+    "max_price": 0.97,
+    "min_secs_to_close": 300,
+    "max_secs_to_close": 129600,
+    "max_contracts_per_order": 10,
+    "max_contracts_per_market": 20,
+    "max_exposure_usd": 50.0,
+    "max_daily_loss_usd": 20.0,
+    "kill_switch_file": "STOP",
+    "max_event_exposure_usd": 20.0
+  },
+  "fees": {
+    "taker_multiplier": 0.07,
+    "maker_multiplier": 0.0,
+    "precision": 0.01
+  }
+}
