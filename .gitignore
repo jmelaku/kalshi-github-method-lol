@@ -37,6 +37,7 @@ htmlcov/
 
 # --- Local settings (copy from config.example.json) ---
 config.json
+config.options.json
 
 # --- Private notes ---
 docs/RESUME_AND_INTERVIEWS.md

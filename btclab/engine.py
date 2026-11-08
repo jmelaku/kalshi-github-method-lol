@@ -14,7 +14,30 @@ Pricing pipeline each cycle (default `pricer="fhs"`):
      contract type (cluster-robust, starts at a conservative prior of 0.5).
   4. Edges are haircut by k * uncertainty before any decision.
 
-The closed-form pricers ("lognormal", "student_t") are kept for comparison.
+`pricer="options"` instead reads probabilities off Deribit's BTC option
+prices (see options.py): the options market sets the variance level and skew,
+and the GARCH fit's hour-of-day seasonality sets how that variance is spread
+through the day. The closed-form pricers ("lognormal", "student_t") are kept
+for comparison.
+
+Execution (`execution`):
+  "taker"  buy at the ask when the haircut edge clears the thresholds (default).
+  "maker"  paper only: rest a bid below fair value and wait for a seller.
+  "both"   take clear edges, and rest bids on markets with no taker trade.
+
+Paper taker fills: an order fills at the ask, up to the size shown there,
+minus whatever our own earlier paper trades already took at that same price
+(`paper_deplete_book`). Without that, paper would keep buying the same
+seller's contracts minute after minute, which a real order can't do.
+
+Paper maker fills: the engine only sees top of book once per cycle, so a
+resting bid at b counts as filled when a later cycle shows the ask for that
+side at or below b (we improved the best bid, so we'd be first in line), or
+strictly below b (we joined an existing bid and would queue behind it).
+Quotes that flicker within a minute are missed, which errs toward fewer
+fills. Fills are recorded with the model's fair value at detection time, so
+adverse selection (getting filled because the price moved against us) shows
+up in expected-vs-realized P&L instead of hiding.
 
 The engine talks to two small interfaces, so the same code runs against live
 Kalshi + Coinbase or the offline simulator:
@@ -46,7 +69,8 @@ from .kalshi import MarketInfo
 from .ledger import Ledger
 from .pricing import ModelParams, fair_prob, tau_from_seconds
 from .risk import Book, RiskManager
-from .scanner import Opportunity, Snapshot, evaluate_prob, rank
+from .options import OptionSurface, variance_clock
+from .scanner import Opportunity, Snapshot, _floor_cent, evaluate_prob, rank
 from .vol import blend, ewma_vol
 
 log = logging.getLogger("btclab")
@@ -64,6 +88,7 @@ class Feed(Protocol):
     def recent_closes(self, minutes: int = 240) -> list[float]: ...
     def recent_candles(self, minutes: int = 240) -> tuple[list[int], list[float]]: ...
     def dvol(self) -> Optional[float]: ...
+    # Optional, needed only for pricer="options":  option_summaries() -> list[dict]
 
 
 def nu_for_horizon(hours: float, table: list[list[float]]) -> float:
@@ -90,7 +115,7 @@ def nu_for_horizon(hours: float, table: list[list[float]]) -> float:
 
 @dataclass
 class EngineConfig:
-    pricer: str = "fhs"  # "fhs" (GARCH + Monte Carlo), "student_t" or "lognormal"
+    pricer: str = "fhs"  # "fhs" (GARCH + Monte Carlo), "options" (Deribit-implied), "student_t" or "lognormal"
     # --- FHS / GARCH ---
     n_paths: int = 20_000
     vol_uncertainty: float = 0.15  # sd of log vol-level scale per path
@@ -114,6 +139,19 @@ class EngineConfig:
     require_market_mid: bool = True
     calib_refit_cycles: int = 60
     calib_min_markets: int = 0  # deprecated (kept so old config files still load)
+    # --- options pricer ---
+    options_iv_rel_sd: float = 0.10  # relative implied-vol bump used for each probability's sd
+    options_refresh_s: float = 60.0  # how often to re-download Deribit option marks
+    # --- spot price and execution ---
+    spot_source: str = "coinbase"  # "coinbase" or "composite" (median of 4 exchanges, closer to BRTI)
+    execution: str = "taker"  # "taker", "maker" or "both" (maker is paper only)
+    maker_max_orders_per_cycle: int = 5
+    # Resting bids count against every risk limit as if filled; this caps their
+    # total cost so they can't crowd out taker trades.
+    maker_max_exposure_usd: float = 20.0
+    # Paper realism: contracts we already "bought" at an ask are gone. Kalshi keeps
+    # showing them (our paper trades never reached the book), so subtract them.
+    paper_deplete_book: bool = True
     # --- closed-form pricers ---
     nu_by_horizon: list = field(default_factory=lambda: [[0.25, 8.0], [1.0, 10.0], [6.0, 20.0], [24.0, 50.0]])
     vol_halflife_min: float = 60.0
@@ -139,6 +177,7 @@ class CycleResult:
     skipped: list[tuple[str, str]] = field(default_factory=list)
     garch: Optional[dict] = None
     blend: Optional[dict] = None
+    maker: dict = field(default_factory=lambda: {"placed": 0, "filled": 0, "cancelled": 0, "resting": 0})
 
 
 class Engine:
@@ -157,14 +196,20 @@ class Engine:
         self.x, self.feed, self.ledger, self.risk, self.fees, self.cfg = exchange, feed, ledger, risk, fees, cfg
         if cfg.mode not in ("paper", "live"):
             raise ValueError("mode must be paper or live")
-        if cfg.pricer not in ("fhs", "student_t", "lognormal"):
-            raise ValueError("pricer must be fhs, student_t or lognormal")
+        if cfg.pricer not in ("fhs", "options", "student_t", "lognormal"):
+            raise ValueError("pricer must be fhs, options, student_t or lognormal")
+        if cfg.execution not in ("taker", "maker", "both"):
+            raise ValueError("execution must be taker, maker or both")
+        if cfg.execution != "taker" and cfg.mode == "live":
+            raise ValueError("resting (maker) orders are paper-only for now; use execution=taker for live")
         self.fit: Optional[GarchFit] = None
         self._fit_time: Optional[float] = None
         self.fhs = FHSPricer(cfg.n_paths, cfg.vol_uncertainty, cfg.basis_usd, cfg.mc_seed)
         self.shrink = (ShrinkTable.prior(cfg.shrink_prior_beta, tuple(cfg.evidence_classes)) if cfg.calibrate
                        else ShrinkTable.prior(1.0))
         self._cycles = 0
+        self._opt_rows: Optional[list] = None
+        self._opt_time: Optional[float] = None
 
     # ---------- volatility model ----------
     def _ensure_garch(self, now_ts: float, implied: Optional[float]) -> GarchFit:
@@ -232,7 +277,27 @@ class Engine:
 
         # ---- probabilities for every market ----
         probs: dict[str, tuple[float, float]] = {}
-        if self.cfg.pricer == "fhs":
+        if self.cfg.pricer == "options":
+            fit = self._ensure_garch(now_ts, implied)  # only for its hour-of-day seasonality and vol display
+            sigma_now = fit.annual_vol_now()
+            if self._opt_rows is None or now_ts - (self._opt_time or 0) >= self.cfg.options_refresh_s:
+                self._opt_rows = self.feed.option_summaries()  # type: ignore[attr-defined]
+                self._opt_time = now_ts
+            surf = OptionSurface.from_deribit(self._opt_rows, now_ts, variance_clock(fit.season))
+            cache: dict = {}
+            for m in markets:
+                est = surf.prob(m.contract, spot, m.close_time.timestamp(), self.cfg.basis_usd,
+                                self.cfg.options_iv_rel_sd, cache)
+                probs[m.ticker] = (est.p, est.sd)
+            model_name = "options"
+            first = min((m.close_time.timestamp() for m in markets), default=now_ts + 3600)
+            garch_info = {
+                "options_expiries": len(surf.smiles),
+                "atm_vol_next": round(surf.atm_vol(first), 4),
+                "atm_vol_7d": round(surf.atm_vol(now_ts + 7 * 86400), 4),
+                "vol_now": round(sigma_now, 4),
+            }
+        elif self.cfg.pricer == "fhs":
             fit = self._ensure_garch(now_ts, implied)
             sigma_now = fit.annual_vol_now()
             closes = sorted({m.close_time for m in markets})
@@ -267,6 +332,7 @@ class Engine:
         snaps: list[Snapshot] = []
         opps: list[Opportunity] = []
         k = self.cfg.haircut_k
+        live: dict[str, tuple] = {}  # ticker -> (market, quote, fair_used, sd) for maker orders
 
         for m in markets:
             p, sd = probs[m.ticker]
@@ -283,21 +349,25 @@ class Engine:
                 snap, top = evaluate_prob(m, book, spot, p, sd, sigma_now, model_name, self.fees, now, used, k)
             snaps.append(snap)
             opps.extend(top)
+            live[m.ticker] = (m, q, used, sd)
 
         if self.cfg.record_snapshots:
             self.ledger.add_snapshots(snaps, self.cfg.snapshot_interval_s)
         res.opportunities = rank(opps)
 
-        if trade:
-            traded_markets: set[str] = set()
+        if trade and self.cfg.execution != "taker":
+            self._check_resting(live, now, res)
+
+        traded_markets: set[str] = set()
+        if trade and self.cfg.execution in ("taker", "both"):
             for o in res.opportunities:
                 if len(res.trades) >= self.cfg.max_trades_per_cycle:
                     break
                 if o.ticker in traded_markets:
                     continue  # never buy both sides of one market in a cycle
-                state = Book(self.ledger.market_contracts(o.ticker), self.ledger.exposure(),
-                             self.ledger.daily_pnl(now.date().isoformat()), self.ledger.exposure(o.event_ticker))
-                n, why = self.risk.size(o, state)
+                if self.cfg.mode == "paper" and self.cfg.paper_deplete_book:
+                    o.available = max(0.0, o.available - self.ledger.taken_at(o.ticker, o.side, o.price))
+                n, why = self.risk.size(o, self._risk_state(o, now))
                 if n <= 0:
                     res.skipped.append((o.ticker, why))
                     if why.startswith(("kill switch", "daily loss")):
@@ -307,7 +377,110 @@ class Engine:
                 if t:
                     res.trades.append(t)
                     traded_markets.add(o.ticker)
+        if trade and self.cfg.execution != "taker":
+            self._place_resting(live, traded_markets, now, res)
         return res
+
+    def _risk_state(self, o: Opportunity, now: datetime) -> Book:
+        """Positions plus resting orders (as if they all fill) for the risk checks."""
+        led = self.ledger
+        return Book(
+            led.market_contracts(o.ticker) + led.resting_contracts(o.ticker),
+            led.exposure() + led.resting_exposure(),
+            led.daily_pnl(now.date().isoformat()),
+            led.exposure(o.event_ticker) + led.resting_exposure(o.event_ticker),
+        )
+
+    # ---------- resting (maker) orders, paper only ----------
+    def _side_fair(self, used: float, side: str) -> float:
+        return used if side == "yes" else 1.0 - used
+
+    def _maker_opp(self, m: MarketInfo, side: str, price: float, used: float, sd: float, avail: float,
+                   now: datetime) -> Opportunity:
+        fee = self.fees.fee_per_contract(price, taker=False)
+        fair = self._side_fair(used, side)
+        return Opportunity(m.ticker, m.event_ticker, side, price, fair, fee, fair - price - fee, avail,
+                           m.seconds_to_close(now), sd, self.cfg.haircut_k)
+
+    def _check_resting(self, live: dict, now: datetime, res: CycleResult) -> None:
+        """Fill or cancel each resting order against this cycle's quotes."""
+        l = self.risk.l
+        ts = now.isoformat()
+        for r in self.ledger.resting_orders():
+            info = live.get(r["ticker"])
+            if info is None:
+                self.ledger.close_order(r["id"], "cancelled", ts, "market closed or left the window")
+                res.maker["cancelled"] += 1
+                continue
+            m, q, used, sd = info
+            side, px = r["side"], r["price"]
+            ask = q.yes_ask if side == "yes" else q.no_ask
+            if ask is not None and (ask < px - 1e-9 or (r["improved"] and ask <= px + 1e-9)):
+                o = self._maker_opp(m, side, px, used, sd, r["count"], now)
+                fee = self.fees.maker_fee(px, r["count"])
+                tid = self.ledger.add_trade(o, r["count"], px, fee, "paper", f"order-{r['id']}", ts, "maker")
+                self.ledger.close_order(r["id"], "filled", ts, "", tid)
+                res.maker["filled"] += 1
+                res.trades.append({"id": tid, "ticker": m.ticker, "side": side, "count": r["count"], "price": px,
+                                   "fee": fee, "edge": o.edge, "edge_adj": o.edge_adj, "maker": True})
+                continue
+            o = self._maker_opp(m, side, px, used, sd, r["count"], now)
+            bid = q.yes_bid if side == "yes" else q.no_bid
+            why = ""
+            if o.secs_to_close < l.min_secs_to_close:
+                why = "too close to settlement"
+            elif o.edge_adj < l.min_edge_usd or o.edge_frac < l.min_edge_frac:
+                why = "fair value moved: edge below threshold"
+            elif bid is not None and bid > px + 1e-9:
+                why = "outbid"  # re-placed below if still worth it
+            if why:
+                self.ledger.close_order(r["id"], "cancelled", ts, why)
+                res.maker["cancelled"] += 1
+
+    def _place_resting(self, live: dict, skip: set, now: datetime, res: CycleResult) -> None:
+        """Rest one bid per market at the best price that still clears the edge thresholds."""
+        l = self.risk.l
+        k = self.cfg.haircut_k
+        have = {r["ticker"] for r in self.ledger.resting_orders()}
+        cands = []
+        for t, (m, q, used, sd) in live.items():
+            if t in have or t in skip:
+                continue
+            for side in ("yes", "no"):
+                bid = q.yes_bid if side == "yes" else q.no_bid
+                ask = q.yes_ask if side == "yes" else q.no_ask
+                fair_adj = self._side_fair(used, side) - k * sd
+                # Highest price that still leaves min_edge after the maker fee (fee is tiny at these prices).
+                px = _floor_cent(fair_adj - l.min_edge_usd - self.fees.fee_per_contract(min(max(fair_adj, 0.01), 0.99), taker=False))
+                top = round((bid or 0.0) + 0.01, 2)  # one tick above the best bid
+                px = min(px, top)
+                if ask is not None:
+                    px = min(px, round(ask - 0.01, 2))  # never cross: that would be a taker trade
+                if px < max(l.min_price, 0.01):
+                    continue
+                o = self._maker_opp(m, side, px, used, sd, l.max_contracts_per_order, now)
+                if o.edge_adj >= l.min_edge_usd and o.edge_frac >= l.min_edge_frac:
+                    cands.append((o.edge_adj, o, bid))
+        cands.sort(key=lambda c: c[0], reverse=True)
+        placed: set = set()
+        for _, o, bid in cands:
+            if res.maker["placed"] >= self.cfg.maker_max_orders_per_cycle:
+                break
+            if o.ticker in placed:
+                continue
+            n, why = self.risk.size(o, self._risk_state(o, now))
+            if n <= 0:
+                if why.startswith(("kill switch", "daily loss")):
+                    break
+                continue
+            room = self.cfg.maker_max_exposure_usd - self.ledger.resting_exposure()
+            n = min(n, int(room / o.price))
+            if n <= 0:
+                break  # resting budget used up
+            self.ledger.add_order(o, n, self.cfg.mode, o.price > (bid or 0.0) + 1e-9, now.isoformat())
+            placed.add(o.ticker)
+            res.maker["placed"] += 1
+        res.maker["resting"] = len(self.ledger.resting_orders())
 
     def _execute(self, o: Opportunity, n: int, now: datetime) -> Optional[dict]:
         if self.cfg.mode == "paper":

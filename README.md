@@ -27,7 +27,7 @@ It runs on a laptop using free data, and it starts in paper mode.
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-python -m pytest                       # 46 tests, no network needed
+python -m pytest                       # 59 tests, no network needed
 python -m btclab demo                  # offline simulation, about a minute
 python -m btclab price --spot 80000 --strike 81000 --hours 3 --vol 0.5
 ```
@@ -40,6 +40,7 @@ python -m btclab price --spot 80000 --strike 81000 --hours 3 --vol 0.5
 | 2. Look at live prices | `python -m btclab scan` | Fair value ± uncertainty vs. Kalshi for every open BTC market, with edges before and after the haircut. No trading. |
 | 3. Paper trade | `python -m btclab run --interval 60` | Logs the trades it *would* make at real prices, with every risk check applied, and learns its shrinkage table from settled markets. Run it for weeks. |
 | 4. Score it | `python -m btclab report --breakdown` | Realized vs. expected P&L with a 95% band, model vs. market log loss, calibration table, P&L by side and bucket. |
+| (any time) | `python -m btclab compare data/btclab.db data/options.db` | Side-by-side scorecard of two paper bots since the newer one started: P&L, z, and model-vs-market log loss on the same settled markets. |
 | (any time) | `python -m btclab pnl` | Current profit in one line: realized P&L plus open positions valued at what they would sell for now. Instant, offline. |
 | (any time) | `python -m btclab verify` | Reruns the multi-seed simulation honesty check from the table below. |
 | 5. Go live, small | `python -m btclab run --live` | Real orders. See the checklist below. |
@@ -91,6 +92,22 @@ fair = mid + β(d, contract type) · d,     d = p_model − mid
 ### 4. Decision and sizing
 
 Edge on buying YES at ask *a* is `fair − a − fee(a)`, and decisions use `edge − k·sd`. Fees follow Kalshi's schedule: `round_up(0.07 × C × P × (1 − P))` for takers. Size is 10% Kelly on the haircut probability, then capped per order, per market, per event, and in total.
+
+## A/B test: options-implied pricing, composite spot, resting bids
+
+`config.options.example.json` turns on three opt-in upgrades. Run it as a second paper bot with its own database next to the baseline, then compare:
+
+```bash
+cp config.options.example.json config.options.json
+nohup caffeinate -i .venv/bin/python -u -m btclab --config config.options.json --db data/options.db run --interval 60 > data/options.log 2>&1 &
+python -m btclab compare data/btclab.db data/options.db
+```
+
+1. **Options-implied pricer** (`pricer: "options"`, `btclab/options.py`). Reads probabilities off Deribit's BTC option marks: one smile per expiry (smoothed cubic in log-moneyness, quoted strikes only), total implied variance interpolated between expiries on a variance clock that uses the GARCH hour-of-day seasonality, and P(S > K) = -dC/dK from Black-76 so the skew is included. Each settlement time gets one probability curve, forced non-increasing (no negative density), and every contract reads off it. Hourly contracts sit before Deribit's first expiry, so the smile is carried down two standard ways (same moneyness, same standardized moneyness); the price is their average and half their gap goes into the uncertainty sd, along with a ±10% implied-vol bump. No Monte Carlo: 500 contracts price in about 0.03 s.
+2. **Composite spot** (`spot_source: "composite"`). Median mid of Coinbase, Kraken, Bitstamp and Gemini, four BRTI constituents, instead of Coinbase alone. Falls back to Coinbase if fewer than two respond.
+3. **Resting bids** (`execution: "both"`, paper only). Takes clear edges as before; elsewhere rests one bid per market, one tick above the best bid, capped so the haircut edge still clears the thresholds after the maker fee. A bid counts as filled when a later cycle shows the ask at or below it (we improved the bid) or strictly below it (we joined a bid). Fills are scored with the model's fair value at detection, so adverse selection shows up in expected vs. realized P&L. Resting bids count against every risk limit as if filled, and their total cost is capped by `maker_max_exposure_usd` so they can't crowd out taker trades. `report` adds fill rate and maker-vs-taker P&L.
+
+Changing three things at once means the comparison says whether the bundle helps, not which part. The snapshots record each model's probabilities, so the pricer's accuracy can still be judged on its own.
 
 ## What building it taught me
 
@@ -163,22 +180,25 @@ btclab/
   fees.py        Kalshi fee schedule and rounding
   book.py        order book normalization (Kalshi returns bids only)
   kalshi.py      REST client with RSA-PSS signing, V2 orders, batched settlement lookups
-  marketdata.py  Coinbase / Kraken / Deribit public data
+  marketdata.py  Coinbase / Kraken / Bitstamp / Gemini / Deribit public data, composite spot
+  options.py     options-implied pricer: Deribit smiles, variance-clock interpolation, digitals
   scanner.py     fair value vs. book, edge after fees and haircut, maker quotes
   risk.py        Kelly sizing and hard limits
   engine.py      the loop: fit, simulate, shrink, scan, size, execute, settle
-  ledger.py      SQLite: snapshots, trades, results; P&L honesty check, calibration, breakdowns
+  ledger.py      SQLite: snapshots, trades, resting orders, results; honesty check, calibration, breakdowns
+  compare.py     side-by-side scorecard of two databases over a common window
   validate.py    out-of-sample calibration study on historical candles
   sim.py         simulator: stochastic vol, seasonality, jumps, imperfect market makers
   cli.py         command line
-tests/           46 tests: GARCH parameter recovery, Monte Carlo vs. closed form, shrinkage,
-                 fees, order book, signing, risk, ledger, API wiring, end-to-end simulation
+tests/           59 tests: GARCH parameter recovery, Monte Carlo vs. closed form, shrinkage,
+                 fees, order book, signing, risk, ledger, API wiring, end-to-end simulation,
+                 options pricer vs. lognormal, skew and partitions, composite spot, resting bids, compare
 ```
 
 ## Roadmap
 
 - WebSocket order book stream instead of polling.
-- Maker mode: resting quotes around fair value, with inventory skew and adverse-selection tracking (fills are where the winner's curse bites hardest).
+- Live resting orders (paper maker mode exists; live needs order amend/cancel and fill reconciliation), plus inventory skew.
 - Event-day vol (FOMC, CPI) and weekend effects in the GARCH model.
 - Hedge bracket exposure with Kalshi's BTC perpetuals.
 - Dashboard: live fair-value curve vs. Kalshi prices, P&L, and calibration plot.

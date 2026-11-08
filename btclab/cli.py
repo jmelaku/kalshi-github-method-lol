@@ -68,7 +68,8 @@ def _live_stack(args, mode: str):
     limits, ecfg, fees = load_config(args.config)
     ecfg.mode = mode
     client = KalshiClient.from_env()
-    return Engine(client, MarketData(), Ledger(args.db), RiskManager(limits), fees, ecfg), client
+    feed = MarketData(spot_source=ecfg.spot_source)
+    return Engine(client, feed, Ledger(args.db), RiskManager(limits), fees, ecfg), client
 
 
 def cmd_price(a) -> None:
@@ -89,7 +90,11 @@ def _print_cycle(r) -> None:
     iv = f"{r.sigma_implied:.1%}" if r.sigma_implied else "n/a"
     print(f"spot ${r.spot:,.2f}  vol now {r.sigma_realized:.1%}  implied {iv}  "
           f"markets {r.markets_priced}  books fetched {r.books_fetched}")
-    if r.garch:
+    if r.garch and "options_expiries" in r.garch:
+        g = r.garch
+        print(f"  options: {g['options_expiries']} Deribit expiries  implied vol to next settlement "
+              f"{g['atm_vol_next']:.1%}  to 7 days {g['atm_vol_7d']:.1%}")
+    elif r.garch:
         g = r.garch
         print(f"  GARCH: alpha {g['alpha']}  beta {g['beta']}  tail nu {g['nu']}  "
               f"vol half-life {g['halflife_min']:.0f}m  long-run vol {g['vol_longrun']:.1%}")
@@ -103,8 +108,13 @@ def _print_cycle(r) -> None:
         print(f"  {o.ticker:<32} buy {o.side.upper():<3} @ {o.price:.2f}  fair {o.fair:.3f}±{o.fair_sd:.3f}  "
               f"edge {o.edge:+.3f} -> {o.edge_adj:+.3f}/ct after haircut  avail {o.available:.0f}  "
               f"{o.secs_to_close / 60:.0f}m left")
+    mk = r.maker
+    if any(mk.values()):
+        print(f"  resting bids: {mk['placed']} placed, {mk['filled']} filled, {mk['cancelled']} cancelled, "
+              f"{mk['resting']} resting")
     for t in r.trades:
-        print(f"  TRADE #{t['id']} {t['ticker']} {t['side'].upper()} x{t['count']:g} @ {t['price']:.2f} fee {t['fee']:.2f}")
+        tag = "MAKER FILL" if t.get("maker") else "TRADE"
+        print(f"  {tag} #{t['id']} {t['ticker']} {t['side'].upper()} x{t['count']:g} @ {t['price']:.2f} fee {t['fee']:.2f}")
 
 
 def cmd_scan(a) -> None:
@@ -159,6 +169,14 @@ def _print_report(led: Ledger, mode=None, breakdown: bool = False) -> None:
         print(f"  {'bucket':<9} {'n':>7} {'model':>7} {'market':>7} {'actual':>7}")
         for b in r["calibration_buckets"]:
             print(f"  {b['bucket']:<9} {b['n']:>7} {b['model_avg']:>7.3f} {b['market_avg']:>7.3f} {b['actual_freq']:>7.3f}")
+    stats = led.order_stats()
+    if stats["orders_placed"]:
+        fr = f"{stats['fill_rate']:.0%}" if stats["fill_rate"] is not None else "n/a"
+        print(f"\nResting bids: {stats['orders_placed']} placed, {stats['orders_filled']} filled, "
+              f"{stats['orders_cancelled']} cancelled, {stats['orders_resting']} resting (fill rate {fr})")
+        for b in led.liquidity_breakdown(mode):
+            print(f"  {b['liquidity']:<6} trades {b['trades']:>4}  expected {b['expected']:>8.2f}  "
+                  f"realized {b['realized']:>8.2f}  win {b['win_rate']:.2f}  fees {b['fees']:.2f}")
     if breakdown:
         print("\nP&L by side and fair value:")
         for b in led.breakdown(mode):
@@ -178,6 +196,27 @@ def cmd_pnl(a) -> None:
         note = f"   {c['unpriced_open_trades']} open trades had no quote and are carried at cost" if c["unpriced_open_trades"] else ""
         print(f"  open positions cost {c['open_cost']:.2f}, worth {c['open_value']:.2f} at the bid "
               f"(quotes as of {(c['quotes_as_of'] or 'n/a')[:16].replace('T', ' ')} UTC){note}")
+
+
+def cmd_compare(a) -> None:
+    from .compare import compare
+
+    since, sa, sb = compare(a.db_a, a.db_b, a.since)
+    labels = [
+        ("trades", "trades"), ("maker_fills", "  of which resting-bid fills"), ("settled", "settled"),
+        ("realized_pnl", "realized P&L"), ("expected_pnl", "expected P&L"), ("fees", "fees"),
+        ("win_rate", "win rate"), ("events", "settlement times"), ("pnl_gap_z", "z (realized vs expected)"),
+        ("accuracy_points", "accuracy points (same markets)"), ("logloss_model", "model log loss"),
+        ("logloss_market", "market log loss"), ("edge_over_market", "edge over market (+ is better)"),
+    ]
+    na, nb = os.path.basename(a.db_a), os.path.basename(a.db_b)
+    print(f"since {since[:16].replace('T', ' ')} UTC\n")
+    print(f"  {'':<32} {na:>14} {nb:>14}")
+    for key, label in labels:
+        va, vb = sa.get(key), sb.get(key)
+        fmt = lambda v: "n/a" if v is None else (f"{v:+.2f}" if key in ("realized_pnl", "expected_pnl", "pnl_gap_z")
+                                                 else f"{v:g}")
+        print(f"  {label:<32} {fmt(va):>14} {fmt(vb):>14}")
 
 
 def cmd_validate(a) -> None:
@@ -297,6 +336,12 @@ def main(argv=None) -> None:
     p.add_argument("--mode", choices=["paper", "live"])
     p.add_argument("--breakdown", action="store_true", help="P&L by side and fair-value bucket")
     p.set_defaults(fn=cmd_report)
+
+    p = sub.add_parser("compare", help="side-by-side scorecard of two paper-trading databases")
+    p.add_argument("db_a", help="e.g. data/btclab.db")
+    p.add_argument("db_b", help="e.g. data/options.db")
+    p.add_argument("--since", help="ISO time to start from (default: when the newer database began)")
+    p.set_defaults(fn=cmd_compare)
 
     p = sub.add_parser("pnl", help="current profit: realized plus open positions at the bid (offline, instant)")
     p.add_argument("--mode", choices=["paper", "live"])

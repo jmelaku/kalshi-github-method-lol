@@ -16,7 +16,7 @@ They're comfortable running terminal commands but new to this codebase. Explain 
 - MacBook Air (Apple Silicon), project at `~/Downloads/kalshi-btc-lab`.
 - **System Python 3.9.6** in a venv at `.venv`. Code MUST stay 3.9-compatible: every module uses `from __future__ import annotations`; don't use `match`, runtime `X | Y` unions, `zip(strict=)`, or other 3.10+ features. (`pyproject.toml` says >=3.10; that's stale, 3.9 works and is tested.)
 - A harmless `NotOpenSSLWarning` (LibreSSL) appears on every run. Ignore it.
-- All 46 tests pass on their machine (`python -m pytest`).
+- All 59 tests pass on their machine (`python -m pytest`).
 - They have NOT yet connected a Kalshi API key or run anything against live Kalshi.
 
 ## 2. Current status
@@ -36,7 +36,7 @@ They're comfortable running terminal commands but new to this codebase. Explain 
 All run from the project root with the venv active (`source .venv/bin/activate`).
 
 ```
-python -m pytest                     # 46 tests, offline
+python -m pytest                     # 59 tests, offline
 python -m btclab price --spot 80000 --strike 81000 --hours 3 --vol 0.5   # closed-form calculator
 python -m btclab validate --days 14  # out-of-sample model test on real Coinbase candles (needs network, >=6 days)
 python -m btclab validate --synthetic --days 10   # same, offline on simulated data
@@ -48,6 +48,8 @@ python -m btclab run --live          # real orders (locked, see §8)
 python -m btclab settle              # record results of finished markets
 python -m btclab report [--breakdown] [--mode paper|live]
 python -m btclab pnl [--mode paper|live]           # current profit: realized + open positions at the bid (instant, offline)
+python -m btclab compare data/btclab.db data/options.db [--since ISO]   # A/B scorecard of two paper bots
+python -m btclab --config config.options.json --db data/options.db run   # second paper bot with the upgrades
 ```
 
 Global flags: `--config config.json` (default) and `--db data/btclab.db` (default).
@@ -67,7 +69,10 @@ btclab/
   fees.py        Kalshi fee schedule: round_up(0.07*C*P*(1-P)) taker; maker 0 or 0.0175
   book.py        Order book normalization. Kalshi returns BIDS ONLY: yes_ask = 1 - best_no_bid
   kalshi.py      REST client: RSA-PSS signing, pagination, retries, V2 orders, batched results
-  marketdata.py  Coinbase candles/spot (Kraken fallback), Deribit DVOL. All free, no keys.
+  marketdata.py  Coinbase candles/spot (Kraken fallback), composite spot (median of Coinbase/Kraken/Bitstamp/Gemini),
+                 Deribit DVOL and option marks. All free, no keys.
+  options.py     Options-implied pricer (pricer="options"): Deribit smiles -> P(S_T > K), see §12
+  compare.py     A/B scorecard of two ledgers since a common start, accuracy on the same settled markets
   scanner.py     Snapshot + Opportunity: edge after fees, edge_adj after uncertainty haircut
   risk.py        Fractional Kelly + hard limits (per order/market/event/total, daily loss, STOP file)
   engine.py      The loop. Talks to `Exchange` and `Feed` protocols, so live and sim share code.
@@ -75,7 +80,7 @@ btclab/
   validate.py    Out-of-sample calibration studies on candles
   sim.py         Realistic simulator (stochastic vol, seasonality, fat tails, jumps, imperfect market makers)
   cli.py         argparse CLI
-tests/           46 tests (see §9)
+tests/           59 tests (see §9)
 docs/RESUME_AND_INTERVIEWS.md   resume bullets + interview prep (owner-facing)
 README.md        user-facing docs, including the full version history and verification table
 ```
@@ -161,3 +166,12 @@ The build environment couldn't reach Kalshi. Check these on the first `scan`, an
 2. Then start paper trading (`python -m btclab run --interval 60`) and keep the laptop awake (`caffeinate -i`). Check `report --breakdown` periodically.
 3. Explain results in plain language. "No positive-edge opportunities" is a normal, frequent outcome, especially in the first 10 days, while the shrinkage uses its conservative prior.
 4. Keep the README verification table and `docs/RESUME_AND_INTERVIEWS.md` accurate if results or behavior change. Never fabricate numbers.
+
+## 12. A/B upgrades (added 2026-11-08, all opt-in; defaults unchanged)
+
+`config.options.example.json` enables all three; the owner runs it as a second paper bot (`--db data/options.db`, log `data/options.log`) next to the untouched baseline (`data/btclab.db`, `data/run.log`), and judges with `btclab compare`. Don't change the baseline's config mid-test.
+
+- **`pricer: "options"`** (`options.py`): Deribit option marks, quoted strikes only, per-expiry cubic smile in k with slope-matched linear wings (a kink in the smile = a jump in probability). Total variance interpolated between expiries on a variance clock built from the GARCH hour-of-day seasonality. Before the first expiry (all hourly contracts) the smile is carried down both at the same k and at the same k/sqrt(t); p is their mean and half the gap goes into sd, plus a ±`options_iv_rel_sd` vol bump. One probability curve per settlement time, forced non-increasing, cached per cycle. Risk-neutral, not real-world. Live data shows a steep short-dated put skew, so it often prices P(S > spot) around 0.52–0.55: that is the options market's view, not a bug.
+- **`spot_source: "composite"`**: median mid of four exchanges; falls back to Coinbase with < 2 sources.
+- **`execution: "maker" | "both"`** (paper only; live raises): one resting bid per market at min(fair_adj − min_edge − maker fee, best bid + 1¢, ask − 1¢). Paper fill = later ask ≤ bid (if we improved the bid) or < bid (if we joined). Fills are recorded with fair at detection time, `liquidity='maker'`, maker fee. Cancelled when out of window, outbid, or the edge falls below thresholds. Resting orders count toward every risk limit as if filled; `maker_max_exposure_usd` caps their total. Tables: `orders`; `trades.liquidity` (migration). Known effect: right after an event rolls, new brackets have very wide books, so bids sit far below fair and fill mainly on adverse moves.
+- Bundling three changes means the comparison judges the bundle; snapshot log loss isolates the pricer.

@@ -43,12 +43,19 @@ CREATE TABLE IF NOT EXISTS trades (
 CREATE TABLE IF NOT EXISTS results (ticker TEXT PRIMARY KEY, result TEXT, ts TEXT);
 CREATE TABLE IF NOT EXISTS markets (ticker TEXT PRIMARY KEY, event_ticker TEXT, close_ts REAL, result TEXT);
 CREATE INDEX IF NOT EXISTS markets_open ON markets(result, close_ts);
+CREATE TABLE IF NOT EXISTS orders (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts TEXT, mode TEXT, ticker TEXT, event_ticker TEXT, side TEXT,
+  price REAL, count REAL, fair REAL, fair_sd REAL, improved INTEGER,
+  status TEXT DEFAULT 'resting', done_ts TEXT, reason TEXT, trade_id INTEGER
+);
+CREATE INDEX IF NOT EXISTS orders_status ON orders(status);
 """
 
 # Columns added after v0.1; older databases get them via ALTER TABLE.
 MIGRATIONS = {
     "snapshots": {"fair_sd": "REAL", "fair_used": "REAL"},
-    "trades": {"fair_sd": "REAL", "edge_adj": "REAL"},
+    "trades": {"fair_sd": "REAL", "edge_adj": "REAL", "liquidity": "TEXT"},
 }
 
 
@@ -110,10 +117,11 @@ class Ledger:
         mode: str,
         order_id: str = "",
         ts: Optional[str] = None,
+        liquidity: str = "taker",
     ) -> int:
         cur = self.db.execute(
-            "INSERT INTO trades (ts,mode,ticker,event_ticker,side,price,count,fee,fair,edge,fair_sd,edge_adj,order_id) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO trades (ts,mode,ticker,event_ticker,side,price,count,fee,fair,edge,fair_sd,edge_adj,order_id,"
+            "liquidity) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 ts or datetime.now(timezone.utc).isoformat(),
                 mode,
@@ -129,10 +137,71 @@ class Ledger:
                 o.fair_sd,
                 o.edge_adj,
                 order_id,
+                liquidity,
             ),
         )
         self.db.commit()
         return int(cur.lastrowid)
+
+    # ---- resting (maker) orders, paper only ----
+    def add_order(self, o: Opportunity, count: float, mode: str, improved: bool, ts: str) -> int:
+        cur = self.db.execute(
+            "INSERT INTO orders (ts,mode,ticker,event_ticker,side,price,count,fair,fair_sd,improved) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (ts, mode, o.ticker, o.event_ticker, o.side, o.price, count, o.fair, o.fair_sd, int(improved)),
+        )
+        self.db.commit()
+        return int(cur.lastrowid)
+
+    def resting_orders(self) -> list:
+        return self.db.execute("SELECT * FROM orders WHERE status='resting' ORDER BY id").fetchall()
+
+    def close_order(self, order_id: int, status: str, ts: str, reason: str = "", trade_id: Optional[int] = None) -> None:
+        self.db.execute("UPDATE orders SET status=?, done_ts=?, reason=?, trade_id=? WHERE id=?",
+                        (status, ts, reason, trade_id, order_id))
+        self.db.commit()
+
+    def resting_contracts(self, ticker: str) -> float:
+        r = self.db.execute("SELECT COALESCE(SUM(count),0) FROM orders WHERE status='resting' AND ticker=?", (ticker,))
+        return float(r.fetchone()[0])
+
+    def resting_exposure(self, event_ticker: Optional[str] = None) -> float:
+        """Cost if every resting order filled (risk limits count it as already spent)."""
+        if event_ticker is None:
+            r = self.db.execute("SELECT COALESCE(SUM(price*count),0) FROM orders WHERE status='resting'")
+        else:
+            r = self.db.execute("SELECT COALESCE(SUM(price*count),0) FROM orders WHERE status='resting' "
+                                "AND event_ticker=?", (event_ticker,))
+        return float(r.fetchone()[0])
+
+    def order_stats(self) -> dict:
+        r = self.db.execute(
+            "SELECT COUNT(*) n, SUM(status='filled') filled, SUM(status='cancelled') cancelled, "
+            "SUM(status='resting') resting FROM orders"
+        ).fetchone()
+        n = r["n"] or 0
+        done = (r["filled"] or 0) + (r["cancelled"] or 0)
+        return {"orders_placed": n, "orders_filled": r["filled"] or 0, "orders_cancelled": r["cancelled"] or 0,
+                "orders_resting": r["resting"] or 0,
+                "fill_rate": round((r["filled"] or 0) / done, 3) if done else None}
+
+    def liquidity_breakdown(self, mode: Optional[str] = None) -> list[dict]:
+        """Expected vs realized P&L for maker fills vs taker trades.
+
+        For maker fills, `expected` uses the model's fair value when the fill
+        was detected, so if fills mostly happen when the market moves against
+        us (adverse selection), it shows up as smaller or negative edge here.
+        """
+        where = "AND mode=?" if mode else ""
+        args = (mode,) if mode else ()
+        rows = self.db.execute(
+            f"SELECT COALESCE(liquidity,'taker') liq, COUNT(*) n, SUM(edge*count) exp, SUM(pnl) pnl, "
+            f"AVG(pnl>0) win, SUM(fee) fees FROM trades WHERE status='settled' {where} GROUP BY liq ORDER BY liq",
+            args,
+        ).fetchall()
+        return [{"liquidity": r["liq"], "trades": r["n"], "expected": round(r["exp"], 2),
+                 "realized": round(r["pnl"], 2), "win_rate": round(r["win"], 3), "fees": round(r["fees"], 2)}
+                for r in rows]
 
     def set_result(self, ticker: str, result: str, ts: Optional[str] = None) -> int:
         """Record a settlement and close all trades in that market. Returns trades settled."""
@@ -152,6 +221,19 @@ class Ledger:
         return len(rows)
 
     # ---- reads used by the risk manager ----
+    def taken_at(self, ticker: str, side: str, price: float, mode: str = "paper") -> float:
+        """Contracts our own taker trades already bought at this exact ask.
+
+        Paper fills never touch the real book, so Kalshi keeps showing the
+        seller's full size. A real order would have used those contracts up.
+        """
+        r = self.db.execute(
+            "SELECT COALESCE(SUM(count),0) FROM trades WHERE ticker=? AND side=? AND mode=? "
+            "AND ABS(price-?) < 1e-6 AND COALESCE(liquidity,'taker')='taker'",
+            (ticker, side, mode, price),
+        )
+        return float(r.fetchone()[0])
+
     def market_contracts(self, ticker: str) -> float:
         r = self.db.execute("SELECT COALESCE(SUM(count),0) FROM trades WHERE ticker=? AND status='open'", (ticker,))
         return float(r.fetchone()[0])

@@ -124,3 +124,35 @@ def test_current_pnl_marks_open_trades_at_bid():
     assert c["current_pnl"] == round(6.90 - 0.17, 2)
     assert c["unpriced_open_trades"] == 1
     assert led.current_pnl("live")["open_trades"] == 0
+
+
+def test_paper_cannot_rebuy_contracts_it_already_took(tmp_path):
+    """Kalshi keeps showing a seller's size after a paper buy; paper must treat it as used up."""
+    from btclab.engine import Engine, EngineConfig
+
+    class Ex:
+        def btc_markets(self):
+            raw = {"yes_bid_dollars": 0.20, "yes_ask_dollars": 0.30, "yes_bid_size_fp": 50, "yes_ask_size_fp": 6}
+            return [MarketInfo("KXBTCD-A", "EV", Contract("greater", 80_000.0), NOW + timedelta(hours=2),
+                               "active", "", raw)]
+
+        def orderbook(self, ticker, depth=10):
+            return Quote(yes_bids=[(0.20, 50)], no_bids=[(0.70, 6)])  # 6 YES offered at 0.30
+
+        def market(self, ticker):
+            return {}
+
+    from tests.test_live_wiring import FlatFeed
+
+    def run(deplete):
+        led = Ledger(":memory:")
+        risk = RiskManager(RiskLimits(kill_switch_file=str(tmp_path / "STOP"), bankroll_usd=10_000))
+        cfg = EngineConfig(mc_seed=1, n_paths=4_000, basis_usd=0.0, evidence_classes=[], calibrate=False,
+                           paper_deplete_book=deplete)
+        eng = Engine(Ex(), FlatFeed(), led, risk, cfg=cfg)
+        for i in range(3):
+            eng.cycle(NOW + timedelta(seconds=i))
+        return led.market_contracts("KXBTCD-A")
+
+    assert run(True) == 6  # only what the seller actually offered
+    assert run(False) > 6  # the old behavior re-bought the same 6 every cycle
