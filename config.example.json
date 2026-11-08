@@ -2,7 +2,7 @@
   "engine": {
     "pricer": "fhs",
     "n_paths": 20000,
-    "vol_uncertainty": 0.15,
+    "vol_uncertainty": 0.45,
     "garch_lookback_min": 5760,
     "garch_refit_min": 240,
     "implied_weight": 0.5,

@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Callable, Optional, Sequence
 
 import numpy as np
 from scipy import stats
@@ -140,6 +140,10 @@ def run_fhs(
     n_paths: int = 8000,
     vol_uncertainty: float = 0.15,
     seed: int = 0,
+    max_halflife_min: Optional[float] = None,
+    implied: Optional[Callable[[int], Optional[float]]] = None,
+    implied_weight: float = 0.5,
+    label: str = "garch+fhs",
 ) -> ValidationResult:
     """Out-of-sample test of the GARCH + Monte Carlo pricer.
 
@@ -164,7 +168,9 @@ def run_fhs(
     for i in range(fit_window_min, len(c) - horizon_min, step_min):
         if fit is None or i - fit_at >= refit_every_min:
             start = tuple(fit.extra["x"]) if fit is not None else None
-            fit = fit_garch(r[i - fit_window_min : i], ts[i - fit_window_min + 1 : i + 1], start=start)
+            iv = implied(int(ts[i])) if implied else None
+            fit = fit_garch(r[i - fit_window_min : i], ts[i - fit_window_min + 1 : i + 1], iv, implied_weight,
+                            start=start, max_halflife_min=max_halflife_min)
             fit_at = filtered_to = i
         elif filtered_to < i:
             fit.update(r[filtered_to:i], ts[filtered_to + 1 : i + 1])
@@ -183,4 +189,4 @@ def run_fhs(
         c50 += q[1] <= final <= q[2]
         c90 += q[0] <= final <= q[3]
         n += 1
-    return ValidationResult("garch+fhs", n, ll / n, br / n, c50 / n, c90 / n)
+    return ValidationResult(label, n, ll / n, br / n, c50 / n, c90 / n)

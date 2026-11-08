@@ -261,3 +261,40 @@ def test_compare_uses_common_start_and_same_markets(tmp_path):
     assert sa["accuracy_points"] == sb["accuracy_points"] == 2  # OLD excluded from both
     assert sb["logloss_model"] < sa["logloss_model"]  # 0.8 on YES outcomes beats 0.6
     assert sb["edge_over_market"] > sa["edge_over_market"] > 0
+
+
+def test_no_resting_bids_where_the_model_is_not_trusted(tmp_path):
+    """Above/below contracts are gated (model weight 0): no spread-capture bids there."""
+    ex = Exchange()
+    ex.contract = Contract("greater", 80_000.0)
+    led = Ledger(":memory:")
+    risk = RiskManager(RiskLimits(kill_switch_file=str(tmp_path / "STOP"), bankroll_usd=1000))
+    cfg = EngineConfig(pricer="options", basis_usd=0.0, execution="maker")  # calibrate on: thresholds gated
+    eng = Engine(ex, Feed(deribit_rows(lambda k: 0.50)), led, risk, FeeModel(maker_multiplier=0.0175), cfg)
+    r = eng.cycle(NOW)
+    assert r.maker["placed"] == 0 and led.resting_orders() == []
+
+
+def test_watch_dashboard_renders_from_a_ledger(tmp_path):
+    from rich.console import Console
+
+    from btclab.watch import Bot, BotView, render
+
+    path = str(tmp_path / "bot.db")
+    led = Ledger(path)
+    ex = Exchange()
+    eng = Engine(ex, Feed(deribit_rows(lambda k: 0.50)), led,
+                 RiskManager(RiskLimits(kill_switch_file=str(tmp_path / "STOP"), bankroll_usd=1000)),
+                 FeeModel(maker_multiplier=0.0175),
+                 EngineConfig(pricer="options", basis_usd=0.0, calibrate=False, execution="both"))
+    eng.cycle(NOW)
+    cfg = tmp_path / "c.json"
+    cfg.write_text('{"risk": {"bankroll_usd": 1000}}')
+    view = BotView(Bot("Test bot", path, str(cfg)))
+    d = view.collect(NOW.timestamp())
+    assert d["bankroll"] == 1000 and d["account"] == pytest.approx(1000 + d["current"])
+    assert len(d["resting"]) == 1 and d["resting"][0]["what"] == "$79,750–80,250"
+    console = Console(width=120, record=True)
+    console.print(render([view], 120, NOW.timestamp()))
+    out = console.export_text()
+    assert "Account value" in out and "Resting bids" in out and "$1,000.00" in out

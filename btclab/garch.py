@@ -17,6 +17,16 @@ Model (on de-seasonalized returns e_t = r_t / s(hour of t)):
     the long-run variance. It blends the sample variance with Deribit implied
     vol, so the model mean-reverts toward what the options market expects.
   * alpha, beta, nu are fit by maximum likelihood (Student-t).
+  * Persistence alpha + beta is capped so the vol half-life can't exceed
+    `max_halflife_min`. On a few days of 1-minute data the likelihood is very
+    flat near alpha + beta = 1, so the estimate can drift to "vol never
+    mean-reverts", which carries a quiet (or wild) hour across a 20-hour
+    horizon. A mean reversion slower than the data window isn't something the
+    window can measure anyway.
+  * Refits warm-start from the previous estimate, but the start is pulled back
+    from the flat edge of the parameter transform and a cold start is always
+    tried too; the better likelihood wins. (A warm start that sat on the
+    boundary used to stay there forever: the optimizer saw a flat surface.)
   * The recursion runs through scipy.signal.lfilter, so a fit over a week of
     1-minute data takes well under a second.
 
@@ -125,6 +135,7 @@ def fit_garch(
     implied_annual_vol: Optional[float] = None,
     implied_weight: float = 0.5,
     start: Optional[tuple[float, float, float]] = None,
+    max_halflife_min: Optional[float] = None,
 ) -> GarchFit:
     """Fit GARCH(1,1)-t with variance targeting on 1-minute log returns.
 
@@ -146,9 +157,13 @@ def fit_garch(
         target = math.exp((1 - implied_weight) * math.log(sample_var) + implied_weight * math.log(iv_var))
     e2 = e * e
 
+    p_max = 0.99999
+    if max_halflife_min and max_halflife_min > 1:
+        p_max = min(p_max, 0.5 ** (1.0 / max_halflife_min))
+
     def unpack(x):
-        # persistence p in (0.5, 0.99999), alpha share in (0, 1), nu in (2.1, 60)
-        p = 0.5 + 0.49999 * special.expit(x[0])
+        # persistence p in (0.5, p_max), alpha share in (0, 1), nu in (2.1, 60)
+        p = 0.5 + (p_max - 0.5) * special.expit(x[0])
         a_share = special.expit(x[1])
         alpha = p * a_share * 0.5  # alpha <= p/2 keeps the fit sensible
         beta = p - alpha
@@ -163,14 +178,15 @@ def fit_garch(
             return 1e12
         return -_t_loglik(e2, h, nu)
 
-    x0 = np.array(start) if start is not None else np.array([3.0, -0.5, -1.5])
+    cold = [np.array([3.0, -0.5, -1.5]), np.array([5.0, -1.0, -2.0]), np.array([2.0, 0.0, -1.0])]
+    # Warm start: clip away from the flat tails of the logistic transform, then
+    # also try one cold start so a stuck estimate can always escape.
+    guesses = [np.clip(np.asarray(start, dtype=float), -6.0, 6.0), cold[0]] if start is not None else cold
     best = None
-    for guess in (x0, np.array([5.0, -1.0, -2.0]), np.array([2.0, 0.0, -1.0])):
+    for guess in guesses:
         res = optimize.minimize(nll, guess, method="Nelder-Mead", options={"xatol": 1e-4, "fatol": 1e-3, "maxiter": 600})
         if best is None or res.fun < best.fun:
             best = res
-        if start is not None:
-            break  # warm start: one solve is enough
     alpha, beta, nu = unpack(best.x)
     omega = target * (1 - alpha - beta)
     h = garch_filter(e, omega, alpha, beta, sample_var)
@@ -188,5 +204,6 @@ def fit_garch(
         loglik=-float(best.fun),
         n=int(r.size),
         last_ts=int(ts[-1]),
-        extra={"x": best.x, "sample_annual_vol": math.sqrt(sample_var * MIN_PER_YEAR)},
+        extra={"x": best.x, "sample_annual_vol": math.sqrt(sample_var * MIN_PER_YEAR),
+               "at_cap": bool(alpha + beta >= p_max - 1e-6)},
     )

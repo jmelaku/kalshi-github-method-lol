@@ -198,6 +198,12 @@ def cmd_pnl(a) -> None:
               f"(quotes as of {(c['quotes_as_of'] or 'n/a')[:16].replace('T', ' ')} UTC){note}")
 
 
+def cmd_watch(a) -> None:
+    from .watch import watch
+
+    watch(refresh_s=a.refresh, once=a.once)
+
+
 def cmd_compare(a) -> None:
     from .compare import compare
 
@@ -336,6 +342,11 @@ def main(argv=None) -> None:
     p.add_argument("--mode", choices=["paper", "live"])
     p.add_argument("--breakdown", action="store_true", help="P&L by side and fair-value bucket")
     p.set_defaults(fn=cmd_report)
+
+    p = sub.add_parser("watch", help="live dashboard in this terminal: P&L, account, positions, resting bids")
+    p.add_argument("--refresh", type=float, default=5.0, help="seconds between redraws")
+    p.add_argument("--once", action="store_true", help="print one frame and exit")
+    p.set_defaults(fn=cmd_watch)
 
     p = sub.add_parser("compare", help="side-by-side scorecard of two paper-trading databases")
     p.add_argument("db_a", help="e.g. data/btclab.db")

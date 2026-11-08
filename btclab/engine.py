@@ -61,7 +61,7 @@ from typing import Optional, Protocol
 import numpy as np
 
 from .book import Quote, quote_from_market
-from .calibrate import ShrinkTable, fit_shrink_from_ledger
+from .calibrate import ShrinkTable, contract_class, d_bin, fit_shrink_from_ledger
 from .fees import FeeModel
 from .fhs import FHSPricer
 from .garch import GarchFit, fit_garch
@@ -118,9 +118,10 @@ class EngineConfig:
     pricer: str = "fhs"  # "fhs" (GARCH + Monte Carlo), "options" (Deribit-implied), "student_t" or "lognormal"
     # --- FHS / GARCH ---
     n_paths: int = 20_000
-    vol_uncertainty: float = 0.15  # sd of log vol-level scale per path
+    vol_uncertainty: float = 0.45  # sd of log vol-level scale per path (0.15 before 2026-11-08; see CLAUDE.md §12)
     garch_lookback_min: int = 4 * 1440
     garch_refit_min: int = 240
+    garch_max_halflife_min: Optional[float] = None  # cap on vol mean-reversion half-life (minutes); None = uncapped
     implied_weight: float = 0.5  # weight of DVOL in the long-run variance target
     haircut_k: float = 1.0  # decisions use edge - k * sd
     mc_seed: Optional[int] = None
@@ -220,7 +221,8 @@ class Engine:
             c = np.asarray(closes, dtype=float)
             r = np.diff(np.log(c))
             start = tuple(self.fit.extra["x"]) if self.fit is not None else None
-            self.fit = fit_garch(r, ts[1:], implied, cfg.implied_weight, start=start)
+            self.fit = fit_garch(r, ts[1:], implied, cfg.implied_weight, start=start,
+                                 max_halflife_min=cfg.garch_max_halflife_min)
             self._fit_time = now_ts
             log.info(
                 "GARCH refit: alpha=%.4f beta=%.4f nu=%.1f halflife=%.0fmin vol now %.1f%% long-run %.1f%%",
@@ -349,7 +351,7 @@ class Engine:
                 snap, top = evaluate_prob(m, book, spot, p, sd, sigma_now, model_name, self.fees, now, used, k)
             snaps.append(snap)
             opps.extend(top)
-            live[m.ticker] = (m, q, used, sd)
+            live[m.ticker] = (m, q, used, sd, self._trusted(p, q.mid, m.contract.strike_type))
 
         if self.cfg.record_snapshots:
             self.ledger.add_snapshots(snaps, self.cfg.snapshot_interval_s)
@@ -391,6 +393,17 @@ class Engine:
             led.exposure(o.event_ticker) + led.resting_exposure(o.event_ticker),
         )
 
+    def _trusted(self, p: float, mid: Optional[float], strike_type: str) -> bool:
+        """Does the shrinkage give the model any weight for this contract right now?
+
+        With weight 0 (e.g. above/below contracts before the evidence gate opens)
+        fair value is just Kalshi's mid, and a resting bid below it would be pure
+        spread-capture with no model behind it. We don't rest bids there.
+        """
+        if mid is None:
+            return False
+        return self.shrink.beta.get((contract_class(strike_type), d_bin(p - mid)), 0.0) > 0.0
+
     # ---------- resting (maker) orders, paper only ----------
     def _side_fair(self, used: float, side: str) -> float:
         return used if side == "yes" else 1.0 - used
@@ -412,7 +425,7 @@ class Engine:
                 self.ledger.close_order(r["id"], "cancelled", ts, "market closed or left the window")
                 res.maker["cancelled"] += 1
                 continue
-            m, q, used, sd = info
+            m, q, used, sd, trusted = info
             side, px = r["side"], r["price"]
             ask = q.yes_ask if side == "yes" else q.no_ask
             if ask is not None and (ask < px - 1e-9 or (r["improved"] and ask <= px + 1e-9)):
@@ -427,7 +440,9 @@ class Engine:
             o = self._maker_opp(m, side, px, used, sd, r["count"], now)
             bid = q.yes_bid if side == "yes" else q.no_bid
             why = ""
-            if o.secs_to_close < l.min_secs_to_close:
+            if not trusted:
+                why = "model not trusted for this contract type yet"
+            elif o.secs_to_close < l.min_secs_to_close:
                 why = "too close to settlement"
             elif o.edge_adj < l.min_edge_usd or o.edge_frac < l.min_edge_frac:
                 why = "fair value moved: edge below threshold"
@@ -443,8 +458,8 @@ class Engine:
         k = self.cfg.haircut_k
         have = {r["ticker"] for r in self.ledger.resting_orders()}
         cands = []
-        for t, (m, q, used, sd) in live.items():
-            if t in have or t in skip:
+        for t, (m, q, used, sd, trusted) in live.items():
+            if t in have or t in skip or not trusted:
                 continue
             for side in ("yes", "no"):
                 bid = q.yes_bid if side == "yes" else q.no_bid

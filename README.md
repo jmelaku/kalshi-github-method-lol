@@ -27,7 +27,7 @@ It runs on a laptop using free data, and it starts in paper mode.
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-python -m pytest                       # 59 tests, no network needed
+python -m pytest                       # 64 tests, no network needed
 python -m btclab demo                  # offline simulation, about a minute
 python -m btclab price --spot 80000 --strike 81000 --hours 3 --vol 0.5
 ```
@@ -40,6 +40,7 @@ python -m btclab price --spot 80000 --strike 81000 --hours 3 --vol 0.5
 | 2. Look at live prices | `python -m btclab scan` | Fair value ± uncertainty vs. Kalshi for every open BTC market, with edges before and after the haircut. No trading. |
 | 3. Paper trade | `python -m btclab run --interval 60` | Logs the trades it *would* make at real prices, with every risk check applied, and learns its shrinkage table from settled markets. Run it for weeks. |
 | 4. Score it | `python -m btclab report --breakdown` | Realized vs. expected P&L with a 95% band, model vs. market log loss, calibration table, P&L by side and bucket. |
+| (any time) | `python -m btclab watch` | Live dashboard in the terminal: account value, P&L and returns, open positions, resting bids, recent results, accuracy vs. the market, for every bot. Redraws every 5 s; ctrl+c closes it. Reads local files only. |
 | (any time) | `python -m btclab compare data/btclab.db data/options.db` | Side-by-side scorecard of two paper bots since the newer one started: P&L, z, and model-vs-market log loss on the same settled markets. |
 | (any time) | `python -m btclab pnl` | Current profit in one line: realized P&L plus open positions valued at what they would sell for now. Instant, offline. |
 | (any time) | `python -m btclab verify` | Reruns the multi-seed simulation honesty check from the table below. |
@@ -107,7 +108,13 @@ python -m btclab compare data/btclab.db data/options.db
 2. **Composite spot** (`spot_source: "composite"`). Median mid of Coinbase, Kraken, Bitstamp and Gemini, four BRTI constituents, instead of Coinbase alone. Falls back to Coinbase if fewer than two respond.
 3. **Resting bids** (`execution: "both"`, paper only). Takes clear edges as before; elsewhere rests one bid per market, one tick above the best bid, capped so the haircut edge still clears the thresholds after the maker fee. A bid counts as filled when a later cycle shows the ask at or below it (we improved the bid) or strictly below it (we joined a bid). Fills are scored with the model's fair value at detection, so adverse selection shows up in expected vs. realized P&L. Resting bids count against every risk limit as if filled, and their total cost is capped by `maker_max_exposure_usd` so they can't crowd out taker trades. `report` adds fill rate and maker-vs-taker P&L.
 
+Resting bids are only placed where the shrinkage gives the model some weight. On gated contract types (above/below, until the evidence gate opens) fair value is just Kalshi's mid, and a bid below it would be spread-capture with nothing behind it; the first live hour showed exactly that getting filled on adverse moves.
+
 Changing three things at once means the comparison says whether the bundle helps, not which part. The snapshots record each model's probabilities, so the pricer's accuracy can still be judged on its own.
+
+## Live finding: overconfident at long horizons (2026-11-08)
+
+Two days into paper trading, the baseline's accuracy on settled markets fell from slightly better than Kalshi's (log loss 0.283 vs. 0.285) to much worse (about 0.60 vs. 0.46), starting when next-day contracts began settling. The GARCH fit had drifted to "volatility never mean-reverts" (half-life 48 days), which looked like the cause. It wasn't: a fresh fit lands there too, and an out-of-sample test on 18 days of real candles with historical DVOL showed half-life caps from 6 h to 48 h all within noise of no cap. The real problem was thin tails: at 20 hours the model's 90% interval contained the outcome only 82% of the time. Raising the per-path vol-level uncertainty from 0.15 to 0.45 improved out-of-sample log loss at 1 h, 6 h and 20 h, and roughly triples each probability's uncertainty, so the haircut blocks the near-spot next-day bets that were losing. It doesn't fully fix the 20 h tails (coverage still about 82%); a horizon-dependent blend toward the options-implied distribution is the likely real fix. With 0.45 the 10-day simulations make no trades at all, so the verification numbers below (measured at 0.15) describe the previous setting.
 
 ## What building it taught me
 
@@ -187,10 +194,11 @@ btclab/
   engine.py      the loop: fit, simulate, shrink, scan, size, execute, settle
   ledger.py      SQLite: snapshots, trades, resting orders, results; honesty check, calibration, breakdowns
   compare.py     side-by-side scorecard of two databases over a common window
+  watch.py       live terminal dashboard (rich) over every bot's database
   validate.py    out-of-sample calibration study on historical candles
   sim.py         simulator: stochastic vol, seasonality, jumps, imperfect market makers
   cli.py         command line
-tests/           59 tests: GARCH parameter recovery, Monte Carlo vs. closed form, shrinkage,
+tests/           64 tests: GARCH parameter recovery, Monte Carlo vs. closed form, shrinkage,
                  fees, order book, signing, risk, ledger, API wiring, end-to-end simulation,
                  options pricer vs. lognormal, skew and partitions, composite spot, resting bids, compare
 ```

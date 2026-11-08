@@ -86,6 +86,18 @@ class Ledger:
         self.db.commit()
         self._last_snap: dict[str, float] = {}
 
+    @classmethod
+    def readonly(cls, path: str) -> "Ledger":
+        """Open an existing database for reading only (dashboards, while a bot writes to it)."""
+        led = cls.__new__(cls)
+        led.db = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+        led.db.row_factory = sqlite3.Row
+        led._last_snap = {}
+        return led
+
+    def has_table(self, name: str) -> bool:
+        return self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)).fetchone() is not None
+
     # ---- writes ----
     def add_snapshots(self, snaps: list[Snapshot], min_interval_s: float = 0.0) -> int:
         """Store snapshots, at most one per market every `min_interval_s`. Returns rows written."""

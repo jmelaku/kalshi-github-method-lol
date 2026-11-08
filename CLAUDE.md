@@ -16,7 +16,7 @@ They're comfortable running terminal commands but new to this codebase. Explain 
 - MacBook Air (Apple Silicon), project at `~/Downloads/kalshi-btc-lab`.
 - **System Python 3.9.6** in a venv at `.venv`. Code MUST stay 3.9-compatible: every module uses `from __future__ import annotations`; don't use `match`, runtime `X | Y` unions, `zip(strict=)`, or other 3.10+ features. (`pyproject.toml` says >=3.10; that's stale, 3.9 works and is tested.)
 - A harmless `NotOpenSSLWarning` (LibreSSL) appears on every run. Ignore it.
-- All 59 tests pass on their machine (`python -m pytest`).
+- All 64 tests pass on their machine (`python -m pytest`).
 - They have NOT yet connected a Kalshi API key or run anything against live Kalshi.
 
 ## 2. Current status
@@ -36,7 +36,7 @@ They're comfortable running terminal commands but new to this codebase. Explain 
 All run from the project root with the venv active (`source .venv/bin/activate`).
 
 ```
-python -m pytest                     # 59 tests, offline
+python -m pytest                     # 64 tests, offline
 python -m btclab price --spot 80000 --strike 81000 --hours 3 --vol 0.5   # closed-form calculator
 python -m btclab validate --days 14  # out-of-sample model test on real Coinbase candles (needs network, >=6 days)
 python -m btclab validate --synthetic --days 10   # same, offline on simulated data
@@ -49,6 +49,7 @@ python -m btclab settle              # record results of finished markets
 python -m btclab report [--breakdown] [--mode paper|live]
 python -m btclab pnl [--mode paper|live]           # current profit: realized + open positions at the bid (instant, offline)
 python -m btclab compare data/btclab.db data/options.db [--since ISO]   # A/B scorecard of two paper bots
+python -m btclab watch [--refresh 5] [--once]      # live terminal dashboard of every bot (needs `rich`)
 python -m btclab --config config.options.json --db data/options.db run   # second paper bot with the upgrades
 ```
 
@@ -72,6 +73,7 @@ btclab/
   marketdata.py  Coinbase candles/spot (Kraken fallback), composite spot (median of Coinbase/Kraken/Bitstamp/Gemini),
                  Deribit DVOL and option marks. All free, no keys.
   options.py     Options-implied pricer (pricer="options"): Deribit smiles -> P(S_T > K), see §12
+  watch.py       Live terminal dashboard (rich): opens each ledger read-only (Ledger.readonly), redraws every few s
   compare.py     A/B scorecard of two ledgers since a common start, accuracy on the same settled markets
   scanner.py     Snapshot + Opportunity: edge after fees, edge_adj after uncertainty haircut
   risk.py        Fractional Kelly + hard limits (per order/market/event/total, daily loss, STOP file)
@@ -80,7 +82,7 @@ btclab/
   validate.py    Out-of-sample calibration studies on candles
   sim.py         Realistic simulator (stochastic vol, seasonality, fat tails, jumps, imperfect market makers)
   cli.py         argparse CLI
-tests/           59 tests (see §9)
+tests/           64 tests (see §9)
 docs/RESUME_AND_INTERVIEWS.md   resume bullets + interview prep (owner-facing)
 README.md        user-facing docs, including the full version history and verification table
 ```
@@ -173,5 +175,12 @@ The build environment couldn't reach Kalshi. Check these on the first `scan`, an
 
 - **`pricer: "options"`** (`options.py`): Deribit option marks, quoted strikes only, per-expiry cubic smile in k with slope-matched linear wings (a kink in the smile = a jump in probability). Total variance interpolated between expiries on a variance clock built from the GARCH hour-of-day seasonality. Before the first expiry (all hourly contracts) the smile is carried down both at the same k and at the same k/sqrt(t); p is their mean and half the gap goes into sd, plus a ±`options_iv_rel_sd` vol bump. One probability curve per settlement time, forced non-increasing, cached per cycle. Risk-neutral, not real-world. Live data shows a steep short-dated put skew, so it often prices P(S > spot) around 0.52–0.55: that is the options market's view, not a bug.
 - **`spot_source: "composite"`**: median mid of four exchanges; falls back to Coinbase with < 2 sources.
-- **`execution: "maker" | "both"`** (paper only; live raises): one resting bid per market at min(fair_adj − min_edge − maker fee, best bid + 1¢, ask − 1¢). Paper fill = later ask ≤ bid (if we improved the bid) or < bid (if we joined). Fills are recorded with fair at detection time, `liquidity='maker'`, maker fee. Cancelled when out of window, outbid, or the edge falls below thresholds. Resting orders count toward every risk limit as if filled; `maker_max_exposure_usd` caps their total. Tables: `orders`; `trades.liquidity` (migration). Known effect: right after an event rolls, new brackets have very wide books, so bids sit far below fair and fill mainly on adverse moves.
+- **`execution: "maker" | "both"`** (paper only; live raises): one resting bid per market at min(fair_adj − min_edge − maker fee, best bid + 1¢, ask − 1¢). Paper fill = later ask ≤ bid (if we improved the bid) or < bid (if we joined). Fills are recorded with fair at detection time, `liquidity='maker'`, maker fee. Cancelled when out of window, outbid, the edge falls below thresholds, or the model has zero shrinkage weight for that contract (gated above/below types): never rest spread-capture bids where fair = mid. Resting orders count toward every risk limit as if filled; `maker_max_exposure_usd` caps their total. Tables: `orders`; `trades.liquidity` (migration). Known effect: right after an event rolls, new brackets have very wide books, so bids sit far below fair and fill mainly on adverse moves.
 - Bundling three changes means the comparison judges the bundle; snapshot log loss isolates the pricer.
+
+### Live finding (2026-11-08): baseline overconfident at long horizons; persistence was a red herring
+- **Symptom:** baseline settled-snapshot log loss went from slightly better than the market (0.283 vs 0.285) to much worse (about 0.60 vs 0.46) for snapshots from 2026-11-07 21Z on, i.e. once next-day (~20 h) contracts started settling. It kept buying cheap YES on near-spot next-day brackets that lost when BTC moved $1k+. Shrinkage (beta 0.5) and the haircut kept P&L damage small (z about -0.8).
+- **First suspect, ruled out:** from 2026-11-07 15:06Z the GARCH fit sat at alpha + beta = 0.99999 (vol half-life 69,314 min). A *cold* fit on those windows lands there too (it is the MLE, not a warm-start trap; the likelihood is flat: capping the half-life at 1 day costs only ~3–5 log-lik units of ~36,000). An out-of-sample test on 18 days of real Coinbase candles with hourly Deribit DVOL (`fit every 4 h, 4-day window, $250/$500/$1000 brackets at 1/6/20 h`) found half-life caps of 6 h–48 h all within noise of no cap, and slightly worse at 6 h. So no cap by default. `garch_max_halflife_min` exists (default None) and warm starts are now clipped and compared with a cold start (harmless robustness).
+- **Actual problem:** at 20 h the simulated distribution has thin tails: its 90% interval held the outcome only 82% of the time (50% interval: 55%). Multi-hour trending moves are fatter-tailed than bootstrapped 1-minute shocks through GARCH produce.
+- **Change made:** `vol_uncertainty` 0.15 -> 0.45 (EngineConfig default and config files). Same test: log loss better at every horizon (1 h -0.0047 ± 0.0030, 6 h -0.0107 ± 0.0085, 20 h -0.0197 ± 0.0084, day-block se), and larger per-contract sd means a bigger haircut, the conservative direction. It does **not** fix 20 h tail coverage (still ~82%). Candidate real fixes: horizon-dependent blend toward the options-implied distribution (the options bot already prices from it), or a jump/regime component. Caveat: 15 days, one regime, overlapping 20 h forecasts; revisit with more data.
+- `btclab verify` with 0.45 (4 seeds x 10 days): **0 trades in every seed**, so the honesty check is vacuous, not passed: the larger sd puts every simulated edge under the 2c threshold during the 10-day prior period. On live markets (2026-11-08 ~23:40Z) the per-contract sd was about 3x the old value (±2.3c on near-spot next-day brackets, the trades that were losing), so expect the baseline to trade much less. The baseline was restarted on this setting; compare it from 2026-11-08T23:38 (`btclab compare data/btclab.db data/options.db --since 2026-11-08T23:38`), since earlier baseline data used 0.15.

@@ -48,6 +48,29 @@ def test_garch_recovers_parameters():
     assert np.std(f.resid) == pytest.approx(1.0, abs=1e-6)
 
 
+def test_garch_halflife_cap_is_respected():
+    """Near-integrated data drives the MLE toward alpha + beta = 1; the cap holds it back."""
+    target = 0.5**2 / MIN_PER_YEAR
+    alpha, beta, nu = 0.05, 0.9499, 5.0  # half-life ~ 6900 min
+    r = simulate_garch(8_000, target * (1 - alpha - beta), alpha, beta, nu, seed=5)
+    t = T0 + 60 * np.arange(1, r.size + 1)
+    free = fit_garch(r, t)
+    capped = fit_garch(r, t, max_halflife_min=720)
+    assert free.halflife_min > 720
+    assert capped.halflife_min <= 720 + 1e-6 and capped.extra["at_cap"]
+    assert capped.loglik <= free.loglik + 1e-6  # the cap is a constraint, never a better fit
+
+
+def test_garch_warm_start_from_the_boundary_matches_cold_start():
+    target = 0.5**2 / MIN_PER_YEAR
+    r = simulate_garch(6_000, target * (1 - 0.94), 0.04, 0.90, 5.0, seed=8)  # half-life ~ 11 min
+    t = T0 + 60 * np.arange(1, r.size + 1)
+    cold = fit_garch(r, t)
+    warm = fit_garch(r, t, start=(30.0, -0.5, -1.7))  # far out on the flat edge of the transform
+    assert warm.loglik == pytest.approx(cold.loglik, abs=0.5)
+    assert warm.halflife_min == pytest.approx(cold.halflife_min, rel=0.2)
+
+
 def test_garch_variance_forecast_mean_reverts():
     f = GarchFit(1e-9, 0.05, 0.9, 5, 2e-8, np.ones(24), 8e-8, np.zeros(10), 0.0, 10, T0)
     path = f.expected_variance_path(500)

@@ -3,7 +3,7 @@ name = "btclab"
 version = "0.1.0"
 description = "Price and trade Kalshi's Bitcoin prediction markets"
 requires-python = ">=3.10"
-dependencies = ["numpy>=1.26", "scipy>=1.11", "requests>=2.31", "cryptography>=42"]
+dependencies = ["numpy>=1.26", "scipy>=1.11", "requests>=2.31", "cryptography>=42", "rich>=13"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "pandas>=2.1"]
